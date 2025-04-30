@@ -5,6 +5,7 @@ This service optimizes user prompts for different LLMs based on templates.
 
 import re
 import json
+import time
 import requests
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
@@ -211,17 +212,43 @@ def optimize_prompt():
         }
         
         # Send request to Huggingface API
-        response = requests.post(
-            HUGGINGFACE_API_URL,
-            json=payload,
-            headers=headers
-        )
-        
-        if response.status_code != 200:
-            raise PromptEngineError(
-                f"API error: {response.status_code} - {response.text}",
-                500
+        try:
+            response = requests.post(
+                HUGGINGFACE_API_URL,
+                json=payload,
+                headers=headers,
+                timeout=10  # Add timeout to prevent hanging
             )
+            
+            if response.status_code != 200:
+                raise PromptEngineError(
+                    f"API error: {response.status_code} - {response.text}",
+                    500
+                )
+        except requests.exceptions.RequestException as e:
+            # For testing purposes, if FLASK_DEBUG is True and MOCK_API is set, return mock data
+            if os.environ.get('FLASK_DEBUG') == 'True' and os.environ.get('MOCK_API') == 'True':
+                logger.info("Using mock API response for testing")
+                # Mock response for testing
+                class MockResponse:
+                    def __init__(self):
+                        self.status_code = 200
+                        
+                    def json(self):
+                        return {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": "<EnhancedPrompt>Enhanced version of the prompt for testing</EnhancedPrompt>"
+                                    }
+                                }
+                            ]
+                        }
+                
+                response = MockResponse()
+            else:
+                # In production, raise the error
+                raise PromptEngineError(f"API request failed: {str(e)}", 500)
         
         # Extract response content
         response_data = response.json()
@@ -299,67 +326,87 @@ def optimize_prompt_stream():
                 "Content-Type": "application/json"
             }
             
+            # For testing purposes, if FLASK_DEBUG is True and MOCK_API is set, return mock data
+            if os.environ.get('FLASK_DEBUG') == 'True' and os.environ.get('MOCK_API') == 'True':
+                logger.info("Using mock API streaming response for testing")
+                # Mock streaming response
+                yield f"event: prompt-chunk\ndata: {json.dumps('Enhanced ')}\n\n"
+                time.sleep(0.1)
+                yield f"event: prompt-chunk\ndata: {json.dumps('version of ')}\n\n"
+                time.sleep(0.1)
+                yield f"event: prompt-chunk\ndata: {json.dumps('the prompt for testing')}\n\n"
+                time.sleep(0.1)
+                yield f"event: done\ndata: [STREAM_END]\n\n"
+                return
+            
             # Send streaming request to Huggingface API
-            with requests.post(
-                HUGGINGFACE_API_URL,
-                json=payload,
-                headers=headers,
-                stream=True
-            ) as response:
-                if response.status_code != 200:
-                    error_msg = f"API error: {response.status_code}"
-                    yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
-                    return
-                
-                # Process streaming response
-                buffer = ""
-                inside_enhanced_prompt = False
-                enhanced_prompt_content = ""
-                
-                for line in response.iter_lines():
-                    if line:
-                        line_text = line.decode('utf-8')
-                        
-                        # Skip non-data lines
-                        if not line_text.startswith('data: '):
-                            continue
+            try:
+                with requests.post(
+                    HUGGINGFACE_API_URL,
+                    json=payload,
+                    headers=headers,
+                    stream=True,
+                    timeout=10  # Add timeout to prevent hanging
+                ) as response:
+                    if response.status_code != 200:
+                        error_msg = f"API error: {response.status_code}"
+                        yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
+                        return
+                    
+                    # Process streaming response
+                    buffer = ""
+                    inside_enhanced_prompt = False
+                    
+                    for line in response.iter_lines():
+                        if line:
+                            line_text = line.decode('utf-8')
                             
-                        data_text = line_text[6:]  # Remove 'data: ' prefix
-                        
-                        # Check for stream end
-                        if data_text == "[DONE]":
-                            yield f"event: done\ndata: [STREAM_END]\n\n"
-                            break
-                        
-                        try:
-                            chunk_data = json.loads(data_text)
-                            content = chunk_data.get('choices', [{}])[0].get('delta', {}).get('content', '')
-                            
-                            if content:
-                                buffer += content
+                            # Skip non-data lines
+                            if not line_text.startswith('data: '):
+                                continue
                                 
-                                # Check for opening tag
-                                if '<EnhancedPrompt>' in buffer and not inside_enhanced_prompt:
-                                    idx = buffer.find('<EnhancedPrompt>') + len('<EnhancedPrompt>')
-                                    inside_enhanced_prompt = True
-                                    enhanced_prompt_content = buffer[idx:]
-                                    yield f"event: prompt-chunk\ndata: {json.dumps(enhanced_prompt_content)}\n\n"
+                            data_text = line_text[6:]  # Remove 'data: ' prefix
+                            
+                            # Check for stream end
+                            if data_text == "[DONE]":
+                                yield f"event: done\ndata: [STREAM_END]\n\n"
+                                break
+                            
+                            try:
+                                chunk_data = json.loads(data_text)
+                                content = chunk_data.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                                
+                                if content:
+                                    buffer += content
                                     
-                                # Check for content inside tags
-                                elif inside_enhanced_prompt and '</EnhancedPrompt>' not in buffer:
-                                    enhanced_prompt_content = content
-                                    yield f"event: prompt-chunk\ndata: {json.dumps(enhanced_prompt_content)}\n\n"
-                                    
-                                # Check for closing tag
-                                elif inside_enhanced_prompt and '</EnhancedPrompt>' in content:
-                                    idx = content.find('</EnhancedPrompt>')
-                                    if idx > 0:
-                                        enhanced_prompt_content = content[:idx]
+                                    # Check for opening tag
+                                    if '<EnhancedPrompt>' in buffer and not inside_enhanced_prompt:
+                                        idx = buffer.find('<EnhancedPrompt>') + len('<EnhancedPrompt>')
+                                        inside_enhanced_prompt = True
+                                        enhanced_prompt_content = buffer[idx:]
                                         yield f"event: prompt-chunk\ndata: {json.dumps(enhanced_prompt_content)}\n\n"
                                         
-                        except json.JSONDecodeError:
-                            logger.error(f"Failed to parse JSON: {data_text}")
-                            continue
+                                    # Check for content inside tags
+                                    elif inside_enhanced_prompt and '</EnhancedPrompt>' not in buffer:
+                                        enhanced_prompt_content = content
+                                        yield f"event: prompt-chunk\ndata: {json.dumps(enhanced_prompt_content)}\n\n"
+                                        
+                                    # Check for closing tag
+                                    elif inside_enhanced_prompt and '</EnhancedPrompt>' in content:
+                                        idx = content.find('</EnhancedPrompt>')
+                                        if idx > 0:
+                                            enhanced_prompt_content = content[:idx]
+                                            yield f"event: prompt-chunk\ndata: {json.dumps(enhanced_prompt_content)}\n\n"
+                                            
+                            except json.JSONDecodeError:
+                                logger.error(f"Failed to parse JSON: {data_text}")
+                                continue
+                                
+            except requests.exceptions.RequestException as e:
+                # In production, yield an error
+                error_msg = f"API request failed: {str(e)}"
+                yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
+                return
         
         # Return SSE response
         return Response(
